@@ -196,14 +196,16 @@ app.post('/send-message', requireSession, async (req, res) => {
     }
 
     const sentMessage = await req.xmtpClient.sendMessage(recipientAddress, message);
-    const sentAt = sentMessage.sent.toISOString();
+    const sentAt = sentMessage.sentAt
+      ? sentMessage.sentAt.toISOString()
+      : sentMessage.sent.toISOString();
     const payload = {
       id: sentMessage.id,
       content: message,
       sender: req.walletAddress,
       recipient: recipientAddress,
       sentAt,
-      conversationTopic: sentMessage.conversation?.topic ?? null,
+      conversationTopic: sentMessage.conversationTopic ?? null,
       status: 'sent',
     };
 
@@ -253,6 +255,31 @@ app.get('/conversations', requireSession, async (req, res) => {
     });
   } catch (error) {
     console.error('[/conversations] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/conversations/consent', requireSession, async (req, res) => {
+  try {
+    const { peerAddress, consentState } = req.body;
+
+    if (!peerAddress || !consentState) {
+      return res.status(400).json({
+        error: 'peerAddress and consentState are required',
+      });
+    }
+
+    const conversation = await req.xmtpClient.updateConsent(
+      peerAddress,
+      consentState,
+    );
+
+    res.json({
+      success: true,
+      conversation,
+    });
+  } catch (error) {
+    console.error('[/conversations/consent] Error:', error);
     res.status(500).json({ error: error.message });
   }
 });

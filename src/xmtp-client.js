@@ -1,49 +1,97 @@
-import { Client } from '@xmtp/xmtp-js';
-import { Wallet } from 'ethers';
+import { Client, ConsentState, IdentifierKind } from '@xmtp/node-sdk';
+import { Wallet, getBytes } from 'ethers';
+
+const XMTP_ENV = process.env.XMTP_ENV || 'dev';
+const NS_PER_MS = 1000000n;
+const ACTIVE_CONSENT_STATES = [ConsentState.Allowed, ConsentState.Unknown];
+const POLL_INTERVAL_MS = Number(process.env.XMTP_POLL_INTERVAL_MS || 5000);
+
+function normalizeAddress(address) {
+  return address.toLowerCase();
+}
+
+function addressIdentifier(address) {
+  return {
+    identifier: normalizeAddress(address),
+    identifierKind: IdentifierKind.Ethereum,
+  };
+}
+
+function conversationTopicFor(addressA, addressB) {
+  const addresses = [normalizeAddress(addressA), normalizeAddress(addressB)].sort();
+  return `xmtp_${addresses[0]}_${addresses[1]}`;
+}
+
+function dateToNs(date) {
+  return BigInt(date.getTime()) * NS_PER_MS;
+}
+
+function consentStateToString(consentState) {
+  switch (consentState) {
+    case ConsentState.Allowed:
+      return 'allowed';
+    case ConsentState.Denied:
+      return 'denied';
+    case ConsentState.Unknown:
+    default:
+      return 'unknown';
+  }
+}
+
+function stringToConsentState(consentState) {
+  switch ((consentState || '').toLowerCase()) {
+    case 'allowed':
+      return ConsentState.Allowed;
+    case 'denied':
+      return ConsentState.Denied;
+    default:
+      return ConsentState.Unknown;
+  }
+}
 
 /**
- * XMTP Client wrapper for Meshlix backend
+ * XMTP V3 client wrapper for the Meshlix backend bridge.
  *
- * Handles:
- * - XMTP client initialization
- * - Sending/receiving messages
- * - Conversation management
- * - Real-time message streaming
+ * Keeps the REST/WebSocket payload shape stable for Flutter while using inbox
+ * IDs internally, which is how XMTP V3 addresses direct message peers.
  */
 export class XmtpClient {
   constructor(walletAddress, privateKey) {
-    this.walletAddress = walletAddress;
+    this.walletAddress = normalizeAddress(walletAddress);
     this.privateKey = privateKey;
+    this.wallet = null;
     this.client = null;
-    this.conversations = new Map();
     this.messageListeners = [];
     this.streamController = null;
     this.isConnected = false;
+    this.addressToInboxId = new Map();
+    this.inboxIdToAddress = new Map();
+    this.seenMessageIds = new Set();
+    this.pollTimer = null;
   }
 
-  /**
-   * Initialize the XMTP client
-   */
   async initialize() {
     try {
-      console.log(`[XmtpClient] Initializing for wallet: ${this.walletAddress}`);
+      console.log(`[XmtpClient] Initializing V3 client for wallet: ${this.walletAddress}`);
 
-      // Create ethers wallet from private key
       const cleanKey = this.privateKey.startsWith('0x')
         ? this.privateKey
         : `0x${this.privateKey}`;
-      const wallet = new Wallet(cleanKey);
 
-      // Create XMTP client
-      this.client = await Client.create(wallet, {
-        env: process.env.XMTP_ENV || 'dev' // 'dev' for testing, 'production' for mainnet
+      this.wallet = new Wallet(cleanKey);
+      this.client = await Client.create(this.#createSigner(this.wallet), {
+        env: XMTP_ENV,
+        dbPath: null,
+        disableDeviceSync: true,
       });
 
       this.isConnected = true;
-      console.log(`[XmtpClient] Client initialized: ${this.client.address}`);
+      console.log(`[XmtpClient] Client initialized with inbox: ${this.client.inboxId}`);
 
-      // Start listening for messages
-      this.startMessageStream();
+      await this.client.conversations.syncAll(ACTIVE_CONSENT_STATES);
+      await this.#hydrateSeenMessages();
+      await this.startMessageStream();
+      this.startPolling();
 
       return this.client;
     } catch (error) {
@@ -52,227 +100,382 @@ export class XmtpClient {
     }
   }
 
-  /**
-   * Start streaming all messages
-   */
   async startMessageStream() {
-    try {
-      console.log('[XmtpClient] Starting message stream...');
+    this.ensureConnected();
 
-      // Stream all messages from all conversations
-      const stream = await this.client.conversations.streamAllMessages();
+    try {
+      console.log('[XmtpClient] Starting V3 message stream...');
+
+      const stream = await this.client.conversations.streamAllMessages({
+        consentStates: ACTIVE_CONSENT_STATES,
+        onError: (error) => {
+          console.error('[XmtpClient] Stream error:', error);
+        },
+      });
 
       this.streamController = stream;
 
-      // Process incoming messages
       (async () => {
         for await (const message of stream) {
-          // Skip messages sent by self
-          if (message.senderAddress.toLowerCase() === this.walletAddress.toLowerCase()) {
-            continue;
-          }
-
-          const formattedMessage = {
-            id: message.id,
-            content: message.content,
-            sender: message.senderAddress,
-            conversationTopic: message.conversation.topic,
-            sentAt: message.sent.toISOString()
-          };
-
-          console.log(`[XmtpClient] New message from ${message.senderAddress}`);
-
-          // Notify all listeners
-          this.messageListeners.forEach(listener => {
-            try {
-              listener(formattedMessage);
-            } catch (e) {
-              console.error('[XmtpClient] Listener error:', e);
-            }
-          });
+          await this.#dispatchIncomingMessage(message);
         }
-      })();
+      })().catch((error) => {
+        console.error('[XmtpClient] Message stream loop failed:', error);
+      });
 
       console.log('[XmtpClient] Message stream started');
     } catch (error) {
       console.error('[XmtpClient] Failed to start message stream:', error);
+      throw error;
     }
   }
 
-  /**
-   * Register a message listener
-   */
   onMessage(callback) {
     this.messageListeners.push(callback);
   }
 
-  /**
-   * Send a message to a peer
-   */
   async sendMessage(recipientAddress, content) {
     this.ensureConnected();
 
     try {
-      console.log(`[XmtpClient] Sending message to ${recipientAddress}`);
+      const normalizedRecipient = normalizeAddress(recipientAddress);
+      console.log(`[XmtpClient] Sending V3 message to ${normalizedRecipient}`);
 
-      // Get or create conversation
-      let conversation = this.conversations.get(recipientAddress.toLowerCase());
+      const dm = await this.#getOrCreateDmByAddress(normalizedRecipient);
+      const messageId = await dm.sendText(content);
 
-      if (!conversation) {
-        // Check if recipient can receive messages
-        const canMessage = await this.client.canMessage(recipientAddress);
-        if (!canMessage) {
-          throw new Error(`Address ${recipientAddress} is not on the XMTP network`);
-        }
+      console.log(`[XmtpClient] Message sent: ${messageId}`);
 
-        conversation = await this.client.conversations.newConversation(recipientAddress);
-        this.conversations.set(recipientAddress.toLowerCase(), conversation);
-      }
-
-      // Send the message
-      const sentMessage = await conversation.send(content);
-
-      console.log(`[XmtpClient] Message sent: ${sentMessage.id}`);
-
-      return sentMessage;
+      return {
+        id: messageId,
+        conversationTopic: conversationTopicFor(this.walletAddress, normalizedRecipient),
+        sentAt: new Date(),
+      };
     } catch (error) {
       console.error('[XmtpClient] Send message failed:', error);
       throw error;
     }
   }
 
-  /**
-   * Get messages from a conversation
-   */
   async getMessages(peerAddress, since = null) {
     this.ensureConnected();
 
     try {
-      console.log(`[XmtpClient] Fetching messages with ${peerAddress}`);
+      const normalizedPeer = normalizeAddress(peerAddress);
+      console.log(`[XmtpClient] Fetching V3 messages with ${normalizedPeer}`);
 
-      // Get or create conversation
-      let conversation = this.conversations.get(peerAddress.toLowerCase());
-
-      if (!conversation) {
-        const conversations = await this.client.conversations.list();
-        conversation = conversations.find(
-          c => c.peerAddress.toLowerCase() === peerAddress.toLowerCase()
-        );
-
-        if (conversation) {
-          this.conversations.set(peerAddress.toLowerCase(), conversation);
-        }
-      }
-
-      if (!conversation) {
+      const dm = await this.#findDmByAddress(normalizedPeer);
+      if (!dm) {
         return [];
       }
 
-      // Fetch messages
+      await dm.sync();
+
       const options = {};
-      if (since) {
-        options.startTime = since;
+      if (since instanceof Date && !Number.isNaN(since.getTime())) {
+        options.sentAfterNs = dateToNs(since);
       }
 
-      const messages = await conversation.messages(options);
+      const messages = await dm.messages(options);
+      const formattedMessages = await Promise.all(
+        messages.map((message) =>
+          this.#formatDecodedMessage(message, { peerAddress: normalizedPeer }),
+        ),
+      );
 
-      return messages.map(msg => ({
-        id: msg.id,
-        content: msg.content,
-        sender: msg.senderAddress,
-        sentAt: msg.sent.toISOString(),
-        conversationTopic: conversation.topic
-      }));
+      return formattedMessages.filter(Boolean);
     } catch (error) {
       console.error('[XmtpClient] Get messages failed:', error);
       throw error;
     }
   }
 
-  /**
-   * Get all conversations
-   */
   async getConversations() {
     this.ensureConnected();
 
     try {
-      console.log('[XmtpClient] Fetching conversations...');
+      console.log('[XmtpClient] Fetching V3 conversations...');
 
-      const conversations = await this.client.conversations.list();
-
-      // Cache conversations
-      conversations.forEach(conv => {
-        this.conversations.set(conv.peerAddress.toLowerCase(), conv);
+      await this.client.conversations.syncAll(ACTIVE_CONSENT_STATES);
+      const dms = this.client.conversations.listDms({
+        consentStates: ACTIVE_CONSENT_STATES,
       });
 
-      // Get last message for each conversation
       const result = await Promise.all(
-        conversations.map(async (conv) => {
-          const messages = await conv.messages({ limit: 1 });
-          const lastMessage = messages[0];
+        dms.map(async (dm) => {
+          const peerAddress = await this.#resolveAddressForInboxId(dm.peerInboxId);
+          if (!peerAddress) {
+            return null;
+          }
+
+          const lastMessage = await dm.lastMessage();
+          const formattedLastMessage = lastMessage
+            ? await this.#formatDecodedMessage(lastMessage, { peerAddress })
+            : null;
 
           return {
-            topic: conv.topic,
-            peerAddress: conv.peerAddress,
-            createdAt: conv.createdAt.toISOString(),
-            lastMessage: lastMessage ? {
-              id: lastMessage.id,
-              content: lastMessage.content,
-              sender: lastMessage.senderAddress,
-              sentAt: lastMessage.sent.toISOString()
-            } : null
+            topic: conversationTopicFor(this.walletAddress, peerAddress),
+            peerAddress,
+            createdAt: dm.createdAt.toISOString(),
+            lastMessage: formattedLastMessage,
+            consentState: consentStateToString(dm.consentState()),
           };
-        })
+        }),
       );
 
-      console.log(`[XmtpClient] Found ${result.length} conversations`);
-      return result;
+      const conversations = result.filter(Boolean);
+      console.log(`[XmtpClient] Found ${conversations.length} conversations`);
+      return conversations;
     } catch (error) {
       console.error('[XmtpClient] Get conversations failed:', error);
       throw error;
     }
   }
 
-  /**
-   * Check if an address can receive XMTP messages
-   */
   async canMessage(address) {
     this.ensureConnected();
 
     try {
-      return await this.client.canMessage(address);
+      const results = await this.client.canMessage([addressIdentifier(address)]);
+      return Boolean(results.values().next().value);
     } catch (error) {
       console.error('[XmtpClient] Can message check failed:', error);
       return false;
     }
   }
 
-  /**
-   * Disconnect the client
-   */
+  async updateConsent(peerAddress, consentState) {
+    this.ensureConnected();
+
+    const normalizedPeer = normalizeAddress(peerAddress);
+    const dm = await this.#findDmByAddress(normalizedPeer);
+    if (!dm) {
+      throw new Error(`No conversation found for ${normalizedPeer}`);
+    }
+
+    dm.updateConsentState(stringToConsentState(consentState));
+    const lastMessage = await dm.lastMessage();
+    const formattedLastMessage = lastMessage
+      ? await this.#formatDecodedMessage(lastMessage, { peerAddress: normalizedPeer })
+      : null;
+
+    return {
+      topic: conversationTopicFor(this.walletAddress, normalizedPeer),
+      peerAddress: normalizedPeer,
+      createdAt: dm.createdAt.toISOString(),
+      lastMessage: formattedLastMessage,
+      consentState: consentStateToString(dm.consentState()),
+    };
+  }
+
   async disconnect() {
     console.log('[XmtpClient] Disconnecting...');
 
-    if (this.streamController) {
-      // Close the stream
-      this.streamController.return?.();
-      this.streamController = null;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
 
+    if (this.streamController?.return) {
+      try {
+        await this.streamController.return();
+      } catch (error) {
+        console.error('[XmtpClient] Stream close failed:', error);
+      }
+    }
+
+    this.streamController = null;
     this.messageListeners = [];
-    this.conversations.clear();
+    this.addressToInboxId.clear();
+    this.inboxIdToAddress.clear();
+    this.seenMessageIds.clear();
     this.isConnected = false;
     this.client = null;
+    this.wallet = null;
 
     console.log('[XmtpClient] Disconnected');
   }
 
-  /**
-   * Ensure client is connected
-   */
   ensureConnected() {
     if (!this.client || !this.isConnected) {
       throw new Error('XMTP client not initialized. Call initialize() first.');
     }
+  }
+
+  #createSigner(wallet) {
+    return {
+      type: 'EOA',
+      getIdentifier: () => addressIdentifier(this.walletAddress),
+      signMessage: async (message) => getBytes(await wallet.signMessage(message)),
+    };
+  }
+
+  startPolling() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+    }
+
+    this.pollTimer = setInterval(() => {
+      this.#pollForMissedMessages().catch((error) => {
+        console.error('[XmtpClient] Polling failed:', error);
+      });
+    }, POLL_INTERVAL_MS);
+  }
+
+  async #hydrateSeenMessages() {
+    const dms = this.client.conversations.listDms({
+      consentStates: ACTIVE_CONSENT_STATES,
+    });
+
+    for (const dm of dms) {
+      const messages = await dm.messages();
+      for (const message of messages) {
+        this.seenMessageIds.add(message.id);
+      }
+    }
+  }
+
+  async #pollForMissedMessages() {
+    this.ensureConnected();
+
+    await this.client.conversations.syncAll(ACTIVE_CONSENT_STATES);
+    const dms = this.client.conversations.listDms({
+      consentStates: ACTIVE_CONSENT_STATES,
+    });
+
+    for (const dm of dms) {
+      const messages = await dm.messages();
+      for (const message of messages) {
+        await this.#dispatchIncomingMessage(message);
+      }
+    }
+  }
+
+  async #getOrCreateDmByAddress(address) {
+    const inboxId = await this.#getInboxIdForAddress(address);
+    if (!inboxId) {
+      throw new Error(`Address ${address} is not on the XMTP network`);
+    }
+
+    let dm = this.client.conversations.getDmByInboxId(inboxId);
+    if (!dm) {
+      dm = await this.client.conversations.createDm(inboxId);
+    }
+
+    this.addressToInboxId.set(address, inboxId);
+    this.inboxIdToAddress.set(inboxId, address);
+
+    return dm;
+  }
+
+  async #findDmByAddress(address) {
+    const inboxId = await this.#getInboxIdForAddress(address);
+    if (!inboxId) {
+      return undefined;
+    }
+
+    let dm = this.client.conversations.getDmByInboxId(inboxId);
+    if (dm) {
+      return dm;
+    }
+
+    await this.client.conversations.sync();
+    return this.client.conversations.getDmByInboxId(inboxId);
+  }
+
+  async #getInboxIdForAddress(address) {
+    const cached = this.addressToInboxId.get(address);
+    if (cached) {
+      return cached;
+    }
+
+    const inboxId = await this.client.fetchInboxIdByIdentifier(addressIdentifier(address));
+    if (inboxId) {
+      this.addressToInboxId.set(address, inboxId);
+      this.inboxIdToAddress.set(inboxId, address);
+    }
+
+    return inboxId;
+  }
+
+  async #resolveAddressForInboxId(inboxId) {
+    const cached = this.inboxIdToAddress.get(inboxId);
+    if (cached) {
+      return cached;
+    }
+
+    const states = await Client.fetchInboxStates([inboxId], XMTP_ENV);
+    const state = states[0];
+    const identifier = state?.identifiers?.find(
+      (entry) => entry.identifierKind === IdentifierKind.Ethereum,
+    );
+
+    if (!identifier?.identifier) {
+      return null;
+    }
+
+    const address = normalizeAddress(identifier.identifier);
+    this.inboxIdToAddress.set(inboxId, address);
+    this.addressToInboxId.set(address, inboxId);
+    return address;
+  }
+
+  async #formatDecodedMessage(message, { peerAddress } = {}) {
+    const content = typeof message.content === 'string' ? message.content : message.fallback;
+    if (!content) {
+      return null;
+    }
+
+    const sender = await this.#resolveAddressForInboxId(message.senderInboxId);
+    if (!sender) {
+      return null;
+    }
+
+    const resolvedPeerAddress =
+      peerAddress ??
+      (sender === this.walletAddress ? null : sender);
+
+    const consentPeerAddress = peerAddress ?? (sender === this.walletAddress ? null : sender);
+    const dm = consentPeerAddress
+      ? await this.#findDmByAddress(consentPeerAddress)
+      : null;
+
+    return {
+      id: message.id,
+      content,
+      sender,
+      sentAt: message.sentAt.toISOString(),
+      conversationTopic: resolvedPeerAddress
+        ? conversationTopicFor(this.walletAddress, resolvedPeerAddress)
+        : null,
+      consentState: dm ? consentStateToString(dm.consentState()) : 'allowed',
+    };
+  }
+
+  async #dispatchIncomingMessage(message) {
+    if (this.seenMessageIds.has(message.id)) {
+      return;
+    }
+
+    this.seenMessageIds.add(message.id);
+
+    const formattedMessage = await this.#formatDecodedMessage(message);
+    if (!formattedMessage) {
+      return;
+    }
+
+    if (normalizeAddress(formattedMessage.sender) === this.walletAddress) {
+      return;
+    }
+
+    console.log(`[XmtpClient] New message from ${formattedMessage.sender}`);
+
+    this.messageListeners.forEach((listener) => {
+      try {
+        listener(formattedMessage);
+      } catch (listenerError) {
+        console.error('[XmtpClient] Listener error:', listenerError);
+      }
+    });
   }
 }
