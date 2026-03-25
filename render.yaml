@@ -2,6 +2,7 @@ services:
   - type: web
     name: meshlix-xmtp-backend
     runtime: docker
+    region: singapore
     plan: free
     autoDeploy: true
     healthCheckPath: /health
