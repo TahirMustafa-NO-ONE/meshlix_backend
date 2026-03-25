@@ -116,13 +116,13 @@ npm start
 
 ## Deploying To Render
 
-This repository includes a root-level `render.yaml` configured for the backend as a Render web service.
+This repository includes a `render.yaml` file configured for the backend as a Render web service.
 
 Render setup summary:
 
 1. Push this repository to GitHub.
 2. In Render, create a new Blueprint and select the repository.
-3. Render will detect [`../render.yaml`](../render.yaml) and create the backend service with `rootDir: backend`.
+3. Render will detect [`./render.yaml`](./render.yaml) and create the backend service.
 4. After the first deploy, open the service and confirm the health check passes at `/health`.
 
 Important notes for Render:
