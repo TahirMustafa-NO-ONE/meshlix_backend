@@ -1,15 +1,11 @@
 services:
   - type: web
     name: meshlix-xmtp-backend
-    runtime: node
+    runtime: docker
     plan: free
     autoDeploy: true
-    buildCommand: npm install
-    startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: NODE_VERSION
-        value: 22
       - key: HOST
         value: 0.0.0.0
       - key: XMTP_ENV

@@ -118,6 +118,8 @@ npm start
 
 This repository includes a `render.yaml` file configured for the backend as a Render web service.
 
+The service is configured to deploy with Docker so the runtime OS stays compatible with XMTP native bindings.
+
 Render setup summary:
 
 1. Push this repository to GitHub.
@@ -129,6 +131,7 @@ Important notes for Render:
 
 - the backend binds to `0.0.0.0` so Render can route traffic correctly
 - HTTP and WebSocket traffic both use the same public service URL
+- the backend uses a `Dockerfile` because XMTP native bindings require a newer glibc than Render's native Node runtime currently provides
 - on Render, clients should use `https://<service>.onrender.com` for HTTP
 - and `wss://<service>.onrender.com` for WebSocket
 
