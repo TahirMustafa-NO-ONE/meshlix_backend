@@ -9,6 +9,7 @@ import { WebSocketManager } from './websocket-manager.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 60 * 1000);
 
 app.use(cors());
@@ -314,8 +315,8 @@ app.post('/session/disconnect', requireSession, async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Meshlix XMTP backend listening on http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`Meshlix XMTP backend listening on http://${HOST}:${PORT}`);
 });
 
 async function shutdown() {

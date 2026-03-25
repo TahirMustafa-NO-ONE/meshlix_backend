@@ -114,6 +114,34 @@ Production-style start:
 npm start
 ```
 
+## Deploying To Render
+
+This repository includes a root-level `render.yaml` configured for the backend as a Render web service.
+
+Render setup summary:
+
+1. Push this repository to GitHub.
+2. In Render, create a new Blueprint and select the repository.
+3. Render will detect [`../render.yaml`](../render.yaml) and create the backend service with `rootDir: backend`.
+4. After the first deploy, open the service and confirm the health check passes at `/health`.
+
+Important notes for Render:
+
+- the backend binds to `0.0.0.0` so Render can route traffic correctly
+- HTTP and WebSocket traffic both use the same public service URL
+- on Render, clients should use `https://<service>.onrender.com` for HTTP
+- and `wss://<service>.onrender.com` for WebSocket
+
+Recommended environment values:
+
+```env
+XMTP_ENV=production
+SESSION_TTL_MS=1800000
+XMTP_POLL_INTERVAL_MS=5000
+```
+
+If you want to use XMTP dev/test traffic instead, change `XMTP_ENV` to `dev`.
+
 When the server starts, it listens on:
 
 ```text
